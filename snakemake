@@ -1,0 +1,211 @@
+#####病毒宏转录组snakemake流程#####
+SAMPLES = ['A2','Y2','V2','P2','K2']
+
+rule all:
+    input:
+        expand("annotation/{sample}_pie_chart.pdf", sample=SAMPLES)
+
+# fastap质控
+rule run_fastp:
+    input:
+        r1='rawdata/{sample}/{sample}_1.fq.gz',
+        r2='rawdata/{sample}/{sample}_2.fq.gz'
+    output:
+        r1='clean_data/{sample}_1.fastp.fq.gz',
+        r2='clean_data/{sample}_2.fastp.fq.gz',
+        report='clean_data/{sample}.fastp.html',
+        json='clean_data/{sample}.fastp.json'
+    threads: 10
+    log: "clean_data/{sample}.fastp.log"
+    shell:
+        """
+        fastp -w {threads} -i {input.r1} -I {input.r2} \
+              -o {output.r1} -O {output.r2} \
+              -h {output.report} -j {output.json} \
+              1>{log} 2>&1
+        """
+
+# megahit拼接
+rule run_megahit:
+    input:
+        r1='clean_data/{sample}_1.fastp.fq.gz',
+        r2='clean_data/{sample}_2.fastp.fq.gz'
+    output:
+        r1="megahit/{sample}.log",
+        r2="megahit/{sample}/final.contigs.fa"
+    params:
+        threads=60,
+        output_folder = "megahit/{sample}"
+    log: "megahit/{sample}.log"
+    shell:
+        """
+        megahit -t {params.threads} -o {params.output_folder} \
+        -1 {input.r1} -2 {input.r2} 1>{log} 2>&1
+        """
+
+# 比对病毒数据库
+rule run_diamond_blastx:
+    input:
+        query="megahit/{sample}/final.contigs.fa",
+        db="/icdc/Users/caozhijie/metatranscribe/database/virus.faa/viral.dmnd"
+    output:
+        r1="diamond_virus/{sample}_blast_virus_db.m8"
+    params:
+        evalue="1e-5",
+        k="1"
+    log:"diamond_virus/{sample}_blast_virus_db.log"
+    shell:
+        """
+        diamond blastx --query {input.query} \
+        --out {output.r1} --db {input.db} \
+        --evalue {params.evalue} -k {params.k} \
+        1>{log} 2>&1
+        """
+
+
+#提取病毒id
+rule extract_ids:
+    input:
+        blast_result="diamond_virus/{sample}_blast_virus_db.m8"
+    output:
+        id_file="diamond_virus/{sample}_blast_virus_db_id.txt"
+    shell:
+        """
+        awk '{{print $1}}' {input.blast_result} > {output.id_file}
+        """
+
+#根据id提取序列
+rule filter_sequences:
+    input:
+        id_file="diamond_virus/{sample}_blast_virus_db_id.txt",
+        query="megahit/{sample}/final.contigs.fa"
+    output:
+        matched_fasta="diamond_virus/{sample}_blast_virus_db_seq.fasta"
+    shell:
+        """
+        seqkit grep --pattern-file {input.id_file} {input.query} > {output.matched_fasta}
+        """
+
+#比对NR数据库
+rule run_diamond_blastx_nr:
+    input:
+        query="diamond_virus/{sample}_blast_virus_db_seq.fasta",
+        db="/icdc/Database/NR_2023_12.dmnd"
+    output:
+        r1="diamond_nr/{sample}_blast_nr_db.m8"
+    log:"diamond_nr/{sample}_blast_nr_db.log"
+    params:
+        outfmt="6",
+        k="1"
+    shell:
+        """
+        diamond blastx --query {input.query} --out {output.r1} \
+        --outfmt {params.outfmt} --db {input.db} -k {params.k} 1>{log} 2>&1
+        """
+
+#提取比对上NR数据库的序列id
+rule extract_ids_nr:
+    input:
+        blast_result="diamond_nr/{sample}_blast_nr_db.m8"
+    output:
+        id_file="diamond_nr/{sample}_blast_nr_db_id.txt"
+    shell:
+        """
+        awk '{{print $1}}' {input.blast_result} > {output.id_file}
+        """
+
+#提取病毒库及NR库序列id差集
+rule find_difference:
+    input:
+        id_file_1="diamond_virus/{sample}_blast_virus_db_id.txt",
+        id_file_2="diamond_nr/{sample}_blast_nr_db_id.txt"
+    output:
+        r1="diamond_nr/{sample}_difference.set"
+    shell:
+        """
+        grep -v -F -f {input.id_file_2} {input.id_file_1} > {output.r1}
+        """
+
+#根据差集id提取病毒比对结果
+rule filter_blast_result:
+    input:
+        diff_file="diamond_nr/{sample}_difference.set",
+        blast_result="diamond_virus/{sample}_blast_virus_db.m8"
+    output:
+        r1="diamond_nr/{sample}_difference.set.m8"
+    shell:
+        """
+        grep -Ff {input.diff_file} -w {input.blast_result} > {output.r1}
+        """
+
+#合并差集至NR数据库比对结果中
+rule concatenate_files:
+    input:
+        dif_result="diamond_nr/{sample}_difference.set.m8",
+        nr_blast="diamond_nr/{sample}_blast_nr_db.m8"
+    output:
+        r1="diamond_nr/{sample}_blast_nr_db_append.m8"
+    shell:
+        """
+        cat {input.dif_result} {input.nr_blast} > {output.r1}
+        """
+
+#提取关键列
+rule extract_fields:
+    input:
+        blast_result="diamond_nr/{sample}_blast_nr_db_append.m8"
+    output:
+        r1="diamond_nr/{sample}_blast_nr_db_append_extract.txt"
+    shell:
+        """
+        awk 'BEGIN {{FS="\t"; OFS="\t"}} {{print $2, $1}}' {input.blast_result} > {output.r1}
+        """
+
+#添加标题
+rule add_title:
+    input:
+        blast_result="diamond_nr/{sample}_blast_nr_db_append_extract.txt"
+    output:
+        r1="diamond_nr/{sample}_blast_nr_db_append_extract_title.txt"
+    shell:
+        """
+        awk 'BEGIN {{print "accession.version\tqseqid"}} {{print $0}}' {input.blast_result} > {output.r1}
+        """
+
+#关联注释表
+rule annotate_potential_virus:
+    input:
+        blast_result="diamond_nr/{sample}_blast_nr_db_append_extract_title.txt",
+        annotation="script/acc_anno_virus_tax.xls"
+    output:
+        r1="annotation/{sample}_potential_virus_annotation",
+        r2="annotation/{sample}_potential_virus_annotation_deltil"
+    shell:
+        """
+        awk 'BEGIN {{FS="\t"}} NR==FNR{{a[$1]=$0; next}} ($1 in a) {{print a[$1] "\t" $0}}' \
+        {input.annotation} {input.blast_result} > {output.r1}
+        sed '1d' {output.r1} > {output.r2}
+        """
+
+#病毒科统计
+rule generate_family_statistics:
+    input:
+        annotation="annotation/{sample}_potential_virus_annotation_deltil"
+    output:
+        r1="annotation/{sample}_potential_virus_family_statistic.txt"
+    shell:
+        """
+        awk '{{print $6}}' {input.annotation} | sort | uniq -c | awk '{{print $1 "\t" $2}}' > {output.r1}
+        """
+
+#绘制各科病毒占比图
+#BiocManager::install(c("tidyverse","ggsci","cowplot","ggrepel"))
+rule plot_pie_chart:
+    input:
+        input_file="annotation/{sample}_potential_virus_family_statistic.txt"
+    output:
+        output_file="annotation/{sample}_pie_chart.pdf"
+    params:
+        script="script/pie_plot.R"
+    shell:
+        "Rscript {params.script} {input.input_file} {output.output_file}"
