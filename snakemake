@@ -1,9 +1,9 @@
 #####病毒宏转录组snakemake流程#####
-SAMPLES = ['A2','Y2','V2','P2','K2']
+SAMPLES = ['A2','A1','K1','M1','V1']
 
 rule all:
     input:
-        expand("annotation/{sample}_pie_chart.pdf", sample=SAMPLES)
+        expand("virfam_id_seq/{sample}_virus_family_sequence", sample=SAMPLES)
 
 # fastap质控
 rule run_fastp:
@@ -209,3 +209,58 @@ rule plot_pie_chart:
         script="script/pie_plot.R"
     shell:
         "Rscript {params.script} {input.input_file} {output.output_file}"
+
+
+#提取脊椎动物病毒
+rule filter_potential_viruses:
+    input:
+        invertebrate_family="script/Invertebrate_family.list",
+        invertebrate_genus="script/Invertebrate_genus.list",
+        annotation="annotation/{sample}_potential_virus_annotation_deltil"
+    output:
+        filtered_annotation="annotation/{sample}_potential_virus_annotation_vetvir"
+    shell:
+        """
+        awk 'NR==FNR{{strings[$1]; next}} {{for (string in strings) if (index($6, string)) next}} 1' \
+        {input.invertebrate_family} {input.annotation} > annotation/del_invertebrate_family && \
+        awk 'NR==FNR{{strings[$1]; next}} {{for (string in strings) if (index($7, string)) next}} 1' \
+        {input.invertebrate_genus} annotation/del_invertebrate_family > {output.filtered_annotation} && \
+        rm -rf  annotation/del_invertebrate_family 
+        """
+
+#脊椎动物病毒科统计
+rule generate_vertebrate_family_statistics:
+    input:
+        annotation="annotation/{sample}_potential_virus_annotation_vetvir"
+    output:
+        r1="annotation/{sample}_potential_vertebrate_virus_family_statistic.txt"
+    shell:
+        """
+        awk '{{print $6}}' {input.annotation} | sort | uniq -c | awk '{{print $1 "\t" $2}}' > {output.r1}
+        """
+
+#提取各科病毒id号
+rule extract_virfam_id:  
+    input:  
+        stat_file="annotation/{sample}_potential_vertebrate_virus_family_statistic.txt",  
+        annotation_dir="annotation/{sample}_potential_virus_annotation_vetvir"  
+    output:  
+        directory("virfam_id_seq/{sample}_virus_family_id")
+    shell:  
+        "python script/name_extract_id.py {input.stat_file} {input.annotation_dir} {output}" 
+
+#根据各科病毒id提取序列
+#pip3 install biopython
+rule extract_sequences:
+    input:
+        id_file="virfam_id_seq/{sample}_virus_family_id",
+        db_fasta="diamond_virus/{sample}_blast_virus_db_seq.fasta"
+    output:
+        directory("virfam_id_seq/{sample}_virus_family_sequence")
+    shell:
+        """
+        python3 script/extract_sequence.py {input.id_file} {input.db_fasta} {output}
+        """
+
+
+        
